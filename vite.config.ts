@@ -14,13 +14,15 @@
 // });
 
 import { defineConfig } from 'vite';
+import vue from '@vitejs/plugin-vue';
 
 export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
   },
+  plugins: [vue()],
   server: {
-    port: 5173,
+    port: 3000, //5173,
   },
 });
