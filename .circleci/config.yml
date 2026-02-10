@@ -1,66 +1,292 @@
 version: 2.1
 
+orbs:
+  docker: circleci/docker@2.4.0
+
 jobs:
-  build_and_push:
+  test:
     docker:
-      - image: cimg/node:20.0.0
+      - image: cimg/node:20.11.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "vite-frontend-app/package-lock.json" }}
+            - v1-deps-
+      - run:
+          name: Install Dependencies
+          command: |
+            cd frontend
+            npm ci
+      - save_cache:
+          paths:
+            - frontend/node_modules
+          key: v1-deps-{{ checksum "vite-frontend-app/package-lock.json" }}
+      - run:
+          name: Run Linting
+          command: |
+            cd frontend
+            npm run lint
+      - store_artifacts:
+          path: vite-frontend-app/eslint.config.js # Just an example artifact
+          destination: lint-config
+
+  build:
+    docker:
+      - image: cimg/base:stable
     steps:
       - checkout
       - setup_remote_docker:
-          docker_layer_caching: true
+          docker_layer_caching: false # Set to true if you have a paid plan
       - run:
-          name: Build and Push to Docker Hub
+          name: Build and Push Docker Image
           command: |
-            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker build -t $DOCKER_USER/vite-frontend-app:latest .
-            docker push $DOCKER_USER/vite-frontend-app:latest
+            # Retry function
+            retry() {
+              local n=1
+              local max=3
+              local delay=5
+              while true; do
+                "$@" && break || {
+                  if [[ $n -lt $max ]]; then
+                    ((n++))
+                    echo "Command failed. Attempt $n/$max:"
+                    sleep $delay;
+                  else
+                    echo "The command has failed after $n attempts."
+                    return 1
+                  fi
+                }
+              done
+            }
+
+            # Login to Docker Hub
+            echo "$DOCKER_PASSWORD" | retry docker login -u "$DOCKER_USER" --password-stdin
+
+            # Variables
+            IMAGE_TAG="${DOCKER_USER}/${DOCKER_REPO}:${CIRCLE_SHA1}"
+            LATEST_TAG="${DOCKER_USER}/${DOCKER_REPO}:latest"
+
+            echo "Building image: $IMAGE_TAG"
+
+            # Build
+            docker build -f vite-frontend-app/Dockerfile.circleci -t $IMAGE_TAG -t $LATEST_TAG vite-frontend-app/
+
+            # Push with retry
+            retry docker push $IMAGE_TAG
+            retry docker push $LATEST_TAG
 
   deploy:
     machine:
       image: ubuntu-2204:current
     steps:
       - run:
-          name: Setup SSH Key and Deploy
+          name: Deploy to EC2 with Rollback Strategy
           command: |
-            # SSH directory banana
+            # Setup SSH
             mkdir -p ~/.ssh
-            
-            # FIX: printf use karne se key ka format (RSA Header/Footer) kharab nahi hota
-            printf "%b" "$EC2_PRIVATE_KEY" > ~/.ssh/id_rsa
-            
-            # Permissions set karna
+
+            # Use Python to robustly format the SSH key
+            # This handles:
+            # 1. Literal "\n" characters (common in CI variables)
+            # 2. Flattened keys (single line with spaces)
+            # 3. Missing newlines
+            python3 -c '
+            import os
+            import sys
+
+            key = os.environ.get("EC2_PRIVATE_KEY", "").strip()
+            if not key:
+                print("Error: EC2_PRIVATE_KEY is empty")
+                sys.exit(1)
+
+            # Fix literal \n (common if pasted as single line in some UIs)
+            key = key.replace("\\n", "\n")
+
+            # Check for flattened keys (one line, spaces instead of newlines)
+            # This happens if the key was pasted into a field that strips newlines
+            if "\n" not in key and "BEGIN" in key:
+                print("Detected flattened key. Attempting to reconstruct...")
+                # supported headers
+                headers = [
+                    ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),
+                    ("-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----"),
+                    ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----")
+                ]
+
+                for h, f in headers:
+                    if h in key and f in key:
+                        # Extract body: remove headers/footers and all whitespace
+                        body = key.replace(h, "").replace(f, "").replace(" ", "")
+                        # Chunk body into 64 chars (standard PEM)
+                        chunked = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
+                        key = f"{h}\n{chunked}\n{f}"
+                        break
+
+            # Write to file with trailing newline
+            path = os.path.expanduser("~/.ssh/id_rsa")
+            with open(path, "w") as f:
+                f.write(key + "\n")
+
+            print(f"Key written to {path}")
+            '
+
+            # Set permissions and verify
             chmod 600 ~/.ssh/id_rsa
-            
-            # EC2 ko known hosts mein add karna
+
+            if ! grep -q "BEGIN" ~/.ssh/id_rsa; then
+              echo "Error: Generated key does not look valid."
+              cat ~/.ssh/id_rsa # Safe to print header? No, better not print private key in logs.
+              exit 1
+            fi
+
             ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
 
-            # SSH connection aur deployment
-            ssh -i ~/.ssh/id_rsa $EC2_USER@$EC2_HOST \<< EOF
-              # Docker Hub Login on EC2
-              echo "$DOCKER_PASS" | sudo docker login -u "$DOCKER_USER" --password-stdin
-              
-              # Purana container cleanup
-              sudo docker stop vite-app || true
-              sudo docker rm vite-app || true
-              
-              # Nayi image pull aur run (Port 4040)
-              sudo docker pull $DOCKER_USER/vite-frontend-app:latest
-              sudo docker run -d --name vite-app -p 4040:4040 $DOCKER_USER/vite-frontend-app:latest
-              
-              # Cleanup unused images
+            # Execute Remote Script
+            ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST \<< EOF
+              set -e
+
+              # ---------------------------------------------------
+              # Helper Functions
+              # ---------------------------------------------------
+              retry() {
+                local n=1
+                local max=3
+                local delay=5
+                while true; do
+                  "\$@" && break || {
+                    if [[ \$n -lt \$max ]]; then
+                      ((n++))
+                      echo "Command failed. Attempt \$n/\$max:"
+                      sleep \$delay;
+                    else
+                      echo "The command has failed after \$n attempts."
+                      return 1
+                    fi
+                  }
+                done
+              }
+
+              check_health() {
+                local url="http://localhost:4040"
+                local max_attempts=12
+                local attempt=1
+
+                echo "Checking health at \$url..."
+                while [ \$attempt -le \$max_attempts ]; do
+                  if curl -s -f "\$url" > /dev/null; then
+                    echo "Health check passed!"
+                    return 0
+                  fi
+                  echo "Health check attempt \$attempt/\$max_attempts failed. Retrying in 5s..."
+                  sleep 5
+                  ((attempt++))
+                done
+
+                echo "Health check failed after \$max_attempts attempts."
+                return 1
+              }
+
+              # 1. Install Docker if not exists
+              if ! command -v docker &> /dev/null; then
+                  echo "Installing Docker..."
+                  sudo apt-get update
+                  sudo apt-get install -y ca-certificates curl gnupg
+                  sudo install -m 0755 -d /etc/apt/keyrings
+                  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+                  echo \
+                    "deb [arch=\"\$(dpkg --print-architecture)\" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                    \$(. /etc/os-release && echo \"\$VERSION_CODENAME\") stable" | \
+                    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                  sudo apt-get update
+                  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                  sudo usermod -aG docker \$USER
+              fi
+
+              # 2. Login to Docker Hub
+              # Note: $DOCKER_PASSWORD and $DOCKER_USER are expanded by CircleCI before sending to SSH
+              echo "$DOCKER_PASSWORD" | retry sudo docker login -u "$DOCKER_USER" --password-stdin
+
+              # 3. Pull latest image
+              # $CIRCLE_SHA1 and others are expanded by CircleCI
+              IMAGE_TAG="${DOCKER_USER}/${DOCKER_REPO}:${CIRCLE_SHA1}"
+              echo "Pulling image: \$IMAGE_TAG"
+              retry sudo docker pull \$IMAGE_TAG
+
+              # 4. Prepare Rollback
+              CONTAINER_NAME="myapp-circleci"
+              BACKUP_NAME="myapp-circleci-backup"
+
+              echo "Checking for existing container..."
+              if sudo docker ps -a --format '{{.Names}}' | grep -q "^\${CONTAINER_NAME}\$"; then
+                echo "Existing container found. Backing up..."
+                # Stop and rename
+                sudo docker stop \$CONTAINER_NAME || true
+                sudo docker rename \$CONTAINER_NAME \$BACKUP_NAME
+                # Ensure backup is stopped
+                sudo docker stop \$BACKUP_NAME || true
+              else
+                echo "No existing container found. Skipping backup."
+              fi
+
+              # 5. Run New Container
+              echo "Starting new container..."
+              # Ensure port is free (though we just stopped the container using it)
+              sudo fuser -k 4040/tcp || true
+
+              sudo docker run -d \
+                --name \$CONTAINER_NAME \
+                --restart always \
+                -p 4040:4040 \
+                \$IMAGE_TAG
+
+              # 6. Health Check
+              echo "Performing health check..."
+              if check_health; then
+                echo "Deployment successful."
+                if sudo docker ps -a --format '{{.Names}}' | grep -q "^\${BACKUP_NAME}\$"; then
+                  echo "Removing backup container..."
+                  sudo docker rm -f \$BACKUP_NAME
+                fi
+              else
+                echo "Health check FAILED. Initiating ROLLBACK..."
+
+                # Stop and remove the broken new container
+                sudo docker rm -f \$CONTAINER_NAME
+
+                # Restore backup if it exists
+                if sudo docker ps -a --format '{{.Names}}' | grep -q "^\${BACKUP_NAME}\$"; then
+                  echo "Restoring backup container..."
+                  sudo docker rename \$BACKUP_NAME \$CONTAINER_NAME
+                  sudo docker start \$CONTAINER_NAME
+                  echo "Rollback completed. Previous version is running."
+                else
+                  echo "No backup found to rollback to. Deployment failed and service is down."
+                fi
+
+                exit 1
+              fi
+
+              # 7. Space Optimization
+              echo "Pruning unused images..."
               sudo docker image prune -f
             EOF
 
 workflows:
-  deploy-workflow:
+  version: 2
+  build-test-deploy:
     jobs:
-      - build_and_push:
+      - test
+      - build:
+          requires:
+            - test
           filters:
             branches:
               only: main
       - deploy:
           requires:
-            - build_and_push
+            - build
           filters:
             branches:
               only: main
