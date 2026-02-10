@@ -22,22 +22,28 @@ jobs:
       - run:
           name: Setup SSH Key and Deploy
           command: |
-            # SSH Key create karna env variable se
+            # SSH directory banana
             mkdir -p ~/.ssh
-            echo "$EC2_PRIVATE_KEY" > ~/.ssh/id_rsa
+            
+            # FIX: printf use karne se key ka format (RSA Header/Footer) kharab nahi hota
+            printf "%b" "$EC2_PRIVATE_KEY" > ~/.ssh/id_rsa
+            
+            # Permissions set karna
             chmod 600 ~/.ssh/id_rsa
+            
+            # EC2 ko known hosts mein add karna
             ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
 
-            # SSH ke zariye EC2 par deployment commands
+            # SSH connection aur deployment
             ssh -i ~/.ssh/id_rsa $EC2_USER@$EC2_HOST \<< EOF
-              # Docker Login on EC2
+              # Docker Hub Login on EC2
               echo "$DOCKER_PASS" | sudo docker login -u "$DOCKER_USER" --password-stdin
               
               # Purana container cleanup
               sudo docker stop vite-app || true
               sudo docker rm vite-app || true
               
-              # Nayi image pull aur run
+              # Nayi image pull aur run (Port 4040)
               sudo docker pull $DOCKER_USER/vite-frontend-app:latest
               sudo docker run -d --name vite-app -p 4040:4040 $DOCKER_USER/vite-frontend-app:latest
               
