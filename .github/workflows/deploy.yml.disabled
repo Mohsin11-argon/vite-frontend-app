@@ -70,4 +70,4 @@ jobs:
             sudo systemctl start nginx
             sudo systemctl enable nginx
             echo "Deployment completed successfully!"
-          EOF
+          EOF                   

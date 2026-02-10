@@ -1,0 +1,68 @@
+version: 2.1
+
+jobs:
+  build_and_push:
+    docker:
+      - image: cimg/node:20.0.0
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build Docker Image
+          command: docker build -t my-vite-app .
+      - run:
+          name: Save image to archive
+          command: docker save -o image.tar my-vite-app
+      - persist_to_workspace:
+          root: .
+          paths:
+            - image.tar
+
+  deploy:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Transfer and Run on EC2
+          command: |
+            # SSH Key add karna (CircleCI Dashboard se set hogi)
+            ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+            
+            # Image ko EC2 pe bhejna
+            scp image.tar $EC2_USER@$EC2_HOST:/tmp/image.tar
+            
+            # EC2 par commands chalana
+            ssh $EC2_USER@$EC2_HOST \<< 'EOF'
+              # Docker install check
+              if ! command -v docker &> /dev/null; then
+                sudo apt-get update && sudo apt-get install -y docker.io
+                sudo systemctl start docker
+                sudo usermod -aG docker $USER
+              fi
+
+              # Purana container saaf karna
+              docker stop vite-app || true
+              docker rm vite-app || true
+              
+              # New image load aur run karna
+              docker load -i /tmp/image.tar
+              docker run -d --name vite-app -p 4040:4040 my-vite-app
+              rm /tmp/image.tar
+            EOF
+
+workflows:
+  deploy-workflow:
+    jobs:
+      - build_and_push:
+          filters:
+            branches:
+              only: main
+      - deploy:
+          requires:
+            - build_and_push
+          filters:
+            branches:
+              only: main
