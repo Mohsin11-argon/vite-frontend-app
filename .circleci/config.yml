@@ -9,48 +9,40 @@ jobs:
       - setup_remote_docker:
           docker_layer_caching: true
       - run:
-          name: Build Docker Image
-          command: docker build -t my-vite-app .
-      - run:
-          name: Save image to archive
-          command: docker save -o image.tar my-vite-app
-      - persist_to_workspace:
-          root: .
-          paths:
-            - image.tar
+          name: Build and Push to Docker Hub
+          command: |
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+            docker build -t $DOCKER_USER/vite-frontend-app:latest .
+            docker push $DOCKER_USER/vite-frontend-app:latest
 
   deploy:
     machine:
       image: ubuntu-2204:current
     steps:
-      - attach_workspace:
-          at: .
       - run:
-          name: Transfer and Run on EC2
+          name: Setup SSH Key and Deploy
           command: |
-            # SSH Key add karna (CircleCI Dashboard se set hogi)
+            # SSH Key create karna env variable se
+            mkdir -p ~/.ssh
+            echo "$EC2_PRIVATE_KEY" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
             ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
-            
-            # Image ko EC2 pe bhejna
-            scp image.tar $EC2_USER@$EC2_HOST:/tmp/image.tar
-            
-            # EC2 par commands chalana
-            ssh $EC2_USER@$EC2_HOST \<< 'EOF'
-              # Docker install check
-              if ! command -v docker &> /dev/null; then
-                sudo apt-get update && sudo apt-get install -y docker.io
-                sudo systemctl start docker
-                sudo usermod -aG docker $USER
-              fi
 
-              # Purana container saaf karna
-              docker stop vite-app || true
-              docker rm vite-app || true
+            # SSH ke zariye EC2 par deployment commands
+            ssh -i ~/.ssh/id_rsa $EC2_USER@$EC2_HOST \<< EOF
+              # Docker Login on EC2
+              echo "$DOCKER_PASS" | sudo docker login -u "$DOCKER_USER" --password-stdin
               
-              # New image load aur run karna
-              docker load -i /tmp/image.tar
-              docker run -d --name vite-app -p 4040:4040 my-vite-app
-              rm /tmp/image.tar
+              # Purana container cleanup
+              sudo docker stop vite-app || true
+              sudo docker rm vite-app || true
+              
+              # Nayi image pull aur run
+              sudo docker pull $DOCKER_USER/vite-frontend-app:latest
+              sudo docker run -d --name vite-app -p 4040:4040 $DOCKER_USER/vite-frontend-app:latest
+              
+              # Cleanup unused images
+              sudo docker image prune -f
             EOF
 
 workflows:
